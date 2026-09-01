@@ -37,6 +37,19 @@ DEFAULT_CONFIG = {
     "auto_mock_on_error": True
 }
 
+def ensure_single_instance():
+    """Garantiza que solo exista 1 única instancia ejecutándose en Windows."""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        mutex_name = "Global\\ScaleWedgePOS_SingleInstance_Mutex"
+        mutex = kernel32.CreateMutexW(None, True, mutex_name)
+        ERROR_ALREADY_EXISTS = 183
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            return None
+        return mutex
+    except Exception:
+        return True
+
 def win32_type_text(text):
     """Escribe texto directamente en la ventana activa utilizando Windows SendInput UNICODE."""
     try:
@@ -99,9 +112,12 @@ class ScaleBridgeApp:
         self.running = True
         self.last_injection_time = 0
         self.lock = threading.Lock()
+        self.active_ser = None
+        self.pynput_listener = None
+        self.reconnect_requested = False
 
-        # Iniciar hilo de lectura serial
-        self.serial_thread = threading.Thread(target=self._serial_loop, daemon=True)
+        # Iniciar ÚNICO hilo de lectura serial controlado
+        self.serial_thread = threading.Thread(target=self._serial_worker, daemon=True)
         self.serial_thread.start()
 
         # Configurar Hotkey global
@@ -113,7 +129,6 @@ class ScaleBridgeApp:
     def _setup_hotkey(self):
         trigger_key = self.config.get("trigger_key", "f2").lower()
 
-        # 1. Registrar con 'keyboard'
         if keyboard:
             try:
                 keyboard.clear_all_hotkeys()
@@ -122,7 +137,6 @@ class ScaleBridgeApp:
             except Exception as e:
                 print(f"Error registrando hotkey con 'keyboard': {e}")
 
-        # 2. Respaldo de listener global con 'pynput'
         if pynput_keyboard:
             def on_press(key):
                 try:
@@ -152,9 +166,40 @@ class ScaleBridgeApp:
         self.last_injection_time = now
         self._inject_weight()
 
-    def _serial_loop(self):
+    def _retry_rs232_connection(self):
+        """Solicita reconexión limpia al hilo trabajador serial sin crear hilos adicionales."""
+        port = self.config.get("port", "COM3")
+        print(f"Solicitando reconexión al puerto RS-232 {port}...")
+        with self.lock:
+            self.is_mock = False
+            self.reconnect_requested = True
+            self.status_msg = f"Conectando {port}..."
+            self.is_connected = False
+
+        if hasattr(self, "canvas_status"):
+            self.canvas_status.itemconfig(self.status_dot, fill="#EAB308")
+
+    def _close_active_serial(self):
+        if self.active_ser:
+            try:
+                if self.active_ser.is_open:
+                    self.active_ser.close()
+            except Exception as e:
+                print(f"Error cerrando puerto serial: {e}")
+            finally:
+                self.active_ser = None
+
+    def _serial_worker(self):
+        """ÚNICO hilo de gestión y lectura del puerto serial RS-232."""
         while self.running:
-            if self.is_mock:
+            with self.lock:
+                is_mock = self.is_mock
+                reconnect = self.reconnect_requested
+                if reconnect:
+                    self.reconnect_requested = False
+
+            if is_mock and not reconnect:
+                self._close_active_serial()
                 with self.lock:
                     self.status_msg = "Modo Simulación"
                     self.is_connected = True
@@ -168,47 +213,62 @@ class ScaleBridgeApp:
                 with self.lock:
                     self.status_msg = "pyserial no instalado"
                     self.is_connected = False
-                if self.config.get("auto_mock_on_error", True):
                     self.is_mock = True
                 time.sleep(2)
                 continue
 
+            # Intentar conexión serial limpia
+            self._close_active_serial()
             try:
-                ser = serial.Serial(port, baudrate, timeout=1)
+                print(f"Intentando abrir puerto {port} a {baudrate} baudios...")
+                self.active_ser = serial.Serial(port, baudrate, timeout=0.2)
+                
                 with self.lock:
                     self.status_msg = f"Conectado ({port})"
                     self.is_connected = True
+                    self.is_mock = False
 
-                while self.running and not self.is_mock:
-                    line = ser.readline().decode("latin-1", errors="ignore").strip()
-                    if line:
-                        match = re.search(r"(\d+\.\d+|\d+,\d+|\d+)", line)
-                        if match:
-                            raw_val = match.group(1).replace(",", ".")
-                            try:
-                                val_float = float(raw_val)
-                                formatted = f"{val_float:.3f}"
-                                with self.lock:
-                                    self.current_weight = formatted
-                            except ValueError:
-                                pass
+                # Bucle de lectura mientras la conexión esté activa
+                while self.running and not self.is_mock and not self.reconnect_requested:
+                    if self.active_ser and self.active_ser.is_open:
+                        try:
+                            line = self.active_ser.readline().decode("latin-1", errors="ignore").strip()
+                            if line:
+                                match = re.search(r"(\d+\.\d+|\d+,\d+|\d+)", line)
+                                if match:
+                                    raw_val = match.group(1).replace(",", ".")
+                                    try:
+                                        val_float = float(raw_val)
+                                        formatted = f"{val_float:.3f}"
+                                        with self.lock:
+                                            self.current_weight = formatted
+                                    except ValueError:
+                                        pass
+                        except Exception as read_err:
+                            print(f"Error de lectura serial: {read_err}")
+                            break
                     time.sleep(0.05)
 
-                ser.close()
+                self._close_active_serial()
 
             except Exception as e:
+                self._close_active_serial()
                 with self.lock:
                     self.status_msg = f"Sin Balanza ({port})"
                     self.is_connected = False
                     if self.current_weight == "0.000":
                         self.current_weight = "1.450"
 
-                print(f"Error Serial en {port}: {e}")
+                print(f"No se pudo conectar a {port}: {e}")
+                
+                # Si falló la conexión y auto_mock está habilitado, pasar a simulación sin bucles infinitos
                 if self.config.get("auto_mock_on_error", True):
-                    print("Activando modo simulación automático...")
-                    self.is_mock = True
+                    print("Cambiando a modo simulación tras fallo de puerto COM.")
+                    with self.lock:
+                        self.is_mock = True
 
-                time.sleep(2)
+                # Pausa para evitar spamear intentos de puerto en bucle rápido
+                time.sleep(2.5)
 
     def _inject_weight(self):
         with self.lock:
@@ -272,7 +332,7 @@ class ScaleBridgeApp:
         )
         self.lbl_title.pack(side=tk.LEFT)
 
-        # Botón pequeño de reconexión rápida en el encabezado
+        # Botón de reconexión rápida
         self.btn_retry = tk.Button(
             header_frame,
             text="🔄",
@@ -308,7 +368,6 @@ class ScaleBridgeApp:
             widget.bind("<B1-Motion>", self._on_drag)
             widget.bind("<ButtonRelease-1>", self._stop_drag)
             widget.bind("<Button-3>", self._show_context_menu)
-            # Doble clic para inyectar directamente como alternativa táctil
             widget.bind("<Double-Button-1>", lambda e: self._inject_weight())
 
         self.context_menu = tk.Menu(self.root, tearoff=0)
@@ -359,26 +418,16 @@ class ScaleBridgeApp:
             self.context_menu.grab_release()
 
     def _set_sim_weight(self, weight_str):
-        self.is_mock = True
         with self.lock:
+            self.is_mock = True
             self.current_weight = weight_str
         print(f"Peso simulado establecido a: {weight_str}")
 
-    def _retry_rs232_connection(self):
-        port = self.config.get("port", "COM3")
-        print(f"Forzando reintento de conexión al puerto RS-232 {port}...")
-        self.is_mock = False
-        with self.lock:
-            self.status_msg = f"Conectando {port}..."
-            self.is_connected = False
-        
-        if hasattr(self, "canvas_status"):
-            self.canvas_status.itemconfig(self.status_dot, fill="#EAB308")
-
     def _toggle_mock(self):
-        self.is_mock = not self.is_mock
-        if self.is_mock:
-            self.current_weight = "1.450"
+        with self.lock:
+            self.is_mock = not self.is_mock
+            if self.is_mock:
+                self.current_weight = "1.450"
         print(f"Modo Simulación: {self.is_mock}")
 
     def _update_hud_loop(self):
@@ -402,14 +451,32 @@ class ScaleBridgeApp:
         self.root.after(100, self._update_hud_loop)
 
     def _quit_app(self):
+        print("Cerrando aplicación de forma limpia...")
         self.running = False
+        self._close_active_serial()
+
+        if self.pynput_listener:
+            try:
+                self.pynput_listener.stop()
+            except Exception:
+                pass
+
         if keyboard:
             try:
                 keyboard.clear_all_hotkeys()
             except Exception:
                 pass
-        self.root.destroy()
+
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
         sys.exit(0)
 
 if __name__ == "__main__":
+    mutex = ensure_single_instance()
+    if mutex is None:
+        print("Ya existe una instancia de ScaleWedgePOS ejecutándose. Saliendo...")
+        sys.exit(0)
     ScaleBridgeApp()
