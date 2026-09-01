@@ -6,6 +6,7 @@ import time
 import threading
 import ctypes
 import tkinter as tk
+from collections import Counter
 
 try:
     import serial
@@ -103,33 +104,48 @@ def save_config(config):
 
 def parse_bbg_primary_weight(buffer_str):
     """
-    Parser exacto para báscula BBG Market 30 / IPBG.
-    Extrae ÚNICA Y EXCLUSIVAMENTE el peso exacto de la pantalla principal (ej. 0.115 kg).
+    Parser de alta precisión de 3 decimales para BBG Market 30 / IPBG.
+    Prioriza números con 3 decimales (ej. 0.305 kg) sobre valores redondeados de 2 decimales (ej. 0.300 kg).
     """
     if not buffer_str or not buffer_str.strip():
         return None
 
     lines = re.split(r"[\r\n]+", buffer_str)
+    
+    # 1. Prioridad Máxima: Buscar lecturas de 3 decimales exactos con 'kg' (ej. +0.305kg)
     for line in reversed(lines):
         clean_line = line.strip()
         if not clean_line:
             continue
-
-        # 1. Buscar la cifra exacta con etiqueta 'kg' (ej: +0.115kg o 0.115 kg)
-        kg_match = re.search(r"[-+]?\s*(\d+[\.,]\d+)\s*kg", clean_line, re.IGNORECASE)
-        if kg_match:
+        kg_3dec = re.search(r"[-+]?\s*(\d+[\.,]\d{3})\s*kg", clean_line, re.IGNORECASE)
+        if kg_3dec:
             try:
-                return float(kg_match.group(1).replace(",", "."))
+                return float(kg_3dec.group(1).replace(",", "."))
             except ValueError:
                 pass
 
-        # 2. Tomar el primer número decimal de la trama (el valor visualizado en la pantalla de la báscula)
-        first_num_match = re.search(r"[-+]?\s*(\d+[\.,]\d+)", clean_line)
-        if first_num_match:
+    # 2. Buscar cualquier cifra de 3 decimales exactos en la trama (ej. 0.305)
+    for line in reversed(lines):
+        clean_line = line.strip()
+        if not clean_line:
+            continue
+        num_3dec = re.search(r"[-+]?\s*(\d+[\.,]\d{3})", clean_line)
+        if num_3dec:
             try:
-                return float(first_num_match.group(1).replace(",", "."))
+                return float(num_3dec.group(1).replace(",", "."))
             except ValueError:
                 pass
+
+    # 3. Respaldo general: Tomar la primera cifra decimal encontrada
+    for line in reversed(lines):
+        clean_line = line.strip()
+        if clean_line:
+            num_any = re.search(r"[-+]?\s*(\d+[\.,]\d+)", clean_line)
+            if num_any:
+                try:
+                    return float(num_any.group(1).replace(",", "."))
+                except ValueError:
+                    pass
 
     return None
 
@@ -147,7 +163,7 @@ class ScaleBridgeApp:
         self.pynput_listener = None
         self.reconnect_requested = False
 
-        # Hilo de lectura de alta precisión y estabilidad
+        # Hilo de lectura estable con Filtro por Mayoría de Votos (Sliding Window Mode)
         self.serial_thread = threading.Thread(target=self._realtime_hardware_worker, daemon=True)
         self.serial_thread.start()
 
@@ -239,12 +255,12 @@ class ScaleBridgeApp:
         return ports_list
 
     def _realtime_hardware_worker(self):
-        """Monitorea el puerto COM con precisión exacta de gramos (0.115 kg) y estabilidad sin parpadeos."""
+        """Monitorea el puerto COM con filtro por mayoría de votos para fijar 0.305 kg sin saltar a 0.300."""
         baudrates = [self.config.get("baudrate", 9600), 9600, 2400, 4800]
         baudrates = list(dict.fromkeys(baudrates))
 
         consecutive_zeros = 0
-        active_locked_weight = 0.0
+        sample_history = []
 
         while self.running:
             with self.lock:
@@ -311,9 +327,9 @@ class ScaleBridgeApp:
                                     break
                             time.sleep(0.02)
 
-                        # Bucle principal de lectura continua con PRECISIÓN EXACTA (0.115 kg)
+                        # Bucle principal de lectura constante con FILTRO DE MAYORÍA DE VOTOS (0.305 kg)
                         if found_scale_on_port:
-                            print(f"¡Báscula BBG transmitiendo exacta en {port_name}!")
+                            print(f"¡Báscula BBG transmitiendo estable en {port_name}!")
                             
                             while self.running and not self.reconnect_requested:
                                 if self.active_ser and self.active_ser.is_open:
@@ -331,21 +347,28 @@ class ScaleBridgeApp:
                                                 last_valid_data_time = time.time()
                                                 buffer_str = ""
 
-                                                if val_float < 0.003:
+                                                formatted_val = f"{val_float:.3f}"
+                                                sample_history.append(formatted_val)
+                                                if len(sample_history) > 5:
+                                                    sample_history.pop(0)
+
+                                                # Obtener la lectura más frecuente en la ventana de muestras
+                                                counts = Counter(sample_history)
+                                                most_common_val, _ = counts.most_common(1)[0]
+                                                most_common_float = float(most_common_val)
+
+                                                if most_common_float < 0.003:
                                                     consecutive_zeros += 1
                                                     if consecutive_zeros >= 3:
-                                                        active_locked_weight = 0.0
+                                                        sample_history.clear()
                                                         with self.lock:
                                                             self.current_weight = "0.000"
                                                             self.is_scale_on = True
                                                             self.status_detail = f"ENCENDIDA ({port_name})"
                                                 else:
                                                     consecutive_zeros = 0
-                                                    # Actualizar directamente al peso exacto de pantalla enviado por la báscula
-                                                    active_locked_weight = val_float
-                                                    formatted = f"{active_locked_weight:.3f}"
                                                     with self.lock:
-                                                        self.current_weight = formatted
+                                                        self.current_weight = most_common_val
                                                         self.is_scale_on = True
                                                         self.status_detail = f"ENCENDIDA ({port_name})"
 
