@@ -272,9 +272,25 @@ class ScaleBridgeApp:
         )
         self.lbl_title.pack(side=tk.LEFT)
 
-        self.canvas_status = tk.Canvas(header_frame, width=10, height=10, bg=bg_color, highlightthickness=0)
+        # Botón pequeño de reconexión rápida en el encabezado
+        self.btn_retry = tk.Button(
+            header_frame,
+            text="🔄",
+            font=("Segoe UI", 7),
+            fg="#94A3B8",
+            bg=bg_color,
+            activebackground="#1E293B",
+            activeforeground="#FFFFFF",
+            bd=0,
+            cursor="hand2",
+            command=self._retry_rs232_connection
+        )
+        self.btn_retry.pack(side=tk.RIGHT, padx=(0, 4))
+
+        self.canvas_status = tk.Canvas(header_frame, width=10, height=10, bg=bg_color, highlightthickness=0, cursor="hand2")
         self.canvas_status.pack(side=tk.RIGHT, pady=2)
         self.status_dot = self.canvas_status.create_oval(1, 1, 9, 9, fill="#EF4444")
+        self.canvas_status.bind("<Button-1>", lambda e: self._retry_rs232_connection())
 
         self.lbl_weight = tk.Label(
             self.frame,
@@ -296,6 +312,8 @@ class ScaleBridgeApp:
             widget.bind("<Double-Button-1>", lambda e: self._inject_weight())
 
         self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="🔌 Reconectar Puerto RS-232 (COM)", command=self._retry_rs232_connection)
+        self.context_menu.add_separator()
         self.context_menu.add_command(label="⚡ Probar Inyección (Simular Tecla)", command=self._inject_weight)
         
         sim_menu = tk.Menu(self.context_menu, tearoff=0)
@@ -345,6 +363,17 @@ class ScaleBridgeApp:
         with self.lock:
             self.current_weight = weight_str
         print(f"Peso simulado establecido a: {weight_str}")
+
+    def _retry_rs232_connection(self):
+        port = self.config.get("port", "COM3")
+        print(f"Forzando reintento de conexión al puerto RS-232 {port}...")
+        self.is_mock = False
+        with self.lock:
+            self.status_msg = f"Conectando {port}..."
+            self.is_connected = False
+        
+        if hasattr(self, "canvas_status"):
+            self.canvas_status.itemconfig(self.status_dot, fill="#EAB308")
 
     def _toggle_mock(self):
         self.is_mock = not self.is_mock
