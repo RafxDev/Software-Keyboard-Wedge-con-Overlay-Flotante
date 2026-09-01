@@ -39,11 +39,12 @@ Cuando estés en el local con el equipo Todo-en-Uno y la báscula comercial:
 3. Despliega la categoría **Puertos (COM y LPT)**.
 4. Anota el número de puerto asignado (ejemplo: `COM1`, `COM3`, `COM4`).
 
-### Paso 2: Configurar `config.json`
-Abre el archivo `config.json` ubicado en la carpeta del programa y ajusta los valores:
+### Paso 2: Configurar `config.json` para la Báscula BBG Market 30 / IPBG
+Abre el archivo `config.json` ubicado en la carpeta del programa y confirma los valores para el modelo **BBG Market 30 / IPBG**:
 
 ```json
 {
+  "scale_model": "BBG Market 30 / IPBG",
   "port": "COM3",
   "baudrate": 9600,
   "trigger_key": "f2",
@@ -52,15 +53,18 @@ Abre el archivo `config.json` ubicado en la carpeta del programa y ajusta los va
   "hud_width": 210,
   "hud_height": 75,
   "mock_mode": false,
-  "auto_mock_on_error": false
+  "auto_mock_on_error": false,
+  "debug_raw_serial": false
 }
 ```
 
-* **`port`**: Cambia `"COM3"` por el puerto detectado en el paso 1 (ej. `"COM1"`).
-* **`baudrate`**: Velocidad en baudios (estándar de la industria: `9600`).
-* **`trigger_key`**: Tecla asignada (`"f2"`, `"space"`, `"f4"`, etc.).
-* **`decimal_separator`**: Use `"."` si tu formulario POS acepta punto (ej. `1.450`), o `","` si exige coma (ej. `1,450`).
-* **`auto_mock_on_error`**: Déjalo en `false` para producción con balanza real.
+* **`scale_model`**: Identificador del modelo (**BBG Market 30 / IPBG**).
+* **`port`**: Cambia `"COM3"` por el puerto detectado en el paso 1 (ej. `"COM1"` o `"COM4"`).
+* **`baudrate`**: `9600` baudios (8 bits de datos, sin paridad, 1 bit de parada - Estándar BBG).
+* **`trigger_key`**: Tecla asignada para inyectar el peso (`"f2"`).
+* **`decimal_separator`**: Usa `"."` si tu formulario POS acepta punto (ej. `1.450`), o `","` si exige coma (ej. `1,450`).
+* **`auto_mock_on_error`**: Déjalo en `false` cuando estés operando la balanza real en el local.
+* **`debug_raw_serial`**: Si se cambia a `true`, guardará una bitácora `debug_serial.log` con las tramas ASCII puras recibidas por la báscula BBG.
 
 ### Paso 3: Verificación de Lectura en Vivo
 1. Enciende la balanza y coloca un objeto o paquete pesado encima.

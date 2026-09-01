@@ -262,6 +262,14 @@ class ScaleBridgeApp:
                                 if complete_frames:
                                     latest_frame = complete_frames[-1].strip()
                                     if latest_frame:
+                                        if self.config.get("debug_raw_serial", False):
+                                            try:
+                                                with open("debug_serial.log", "a", encoding="utf-8") as df:
+                                                    df.write(f"[{time.strftime('%H:%M:%S')}] RAW BBG: {latest_frame}\n")
+                                            except Exception:
+                                                pass
+
+                                        # Expresión regular optimizada para BBG Market 30 (ej. ST,GS,+001.450kg -> 1.450)
                                         match = re.search(r"[-+]?\s*(\d+[\.,]\d+|\d+)", latest_frame)
                                         if match:
                                             raw_val = match.group(1).replace(",", ".")

@@ -1,11 +1,13 @@
 {
-  "port": "COM3",
+  "scale_model": "BBG Market 30 / IPBG",
+  "port": "COM1",
   "baudrate": 9600,
   "trigger_key": "f2",
   "decimal_separator": ".",
   "hud_position": "+1150+20",
-  "hud_width": 200,
+  "hud_width": 210,
   "hud_height": 75,
   "mock_mode": false,
-  "auto_mock_on_error": true
+  "auto_mock_on_error": true,
+  "debug_raw_serial": true
 }
