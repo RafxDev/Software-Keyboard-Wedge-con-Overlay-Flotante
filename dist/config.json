@@ -1,0 +1,11 @@
+{
+  "port": "COM3",
+  "baudrate": 9600,
+  "trigger_key": "f2",
+  "decimal_separator": ".",
+  "hud_position": "+987+237",
+  "hud_width": 210,
+  "hud_height": 75,
+  "mock_mode": false,
+  "auto_mock_on_error": true
+}

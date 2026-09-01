@@ -1,0 +1,4 @@
+pyserial>=3.5
+keyboard>=0.13.5
+pynput>=1.7.6
+pyinstaller>=6.0.0
