@@ -27,7 +27,7 @@ CONFIG_FILE = "config.json"
 
 DEFAULT_CONFIG = {
     "scale_model": "BBG Market 30 / IPBG",
-    "port": "COM2",
+    "port": "COM1",
     "baudrate": 9600,
     "trigger_key": "f2",
     "decimal_separator": ".",
@@ -101,12 +101,47 @@ def save_config(config):
     except Exception as e:
         print(f"Error guardando {CONFIG_FILE}: {e}")
 
+def parse_bbg_primary_weight(buffer_str):
+    """
+    Parser especializado para básculas BBG Market 30 / IPBG.
+    Extrae ÚNICA Y EXCLUSIVAMENTE el primer valor correspondiente al PESO en pantalla,
+    ignorando campos secundarios como tara, precio unitario o código de estado.
+    """
+    if not buffer_str or not buffer_str.strip():
+        return None
+
+    lines = re.split(r"[\r\n]+", buffer_str)
+    # Analizar de la trama más reciente hacia atrás
+    for line in reversed(lines):
+        clean_line = line.strip()
+        if not clean_line:
+            continue
+
+        # 1. Regla Principal: Buscar la cifra asociada explícitamente a 'kg' (ej. +0.120kg o 0.120 kg)
+        kg_match = re.search(r"[-+]?\s*(\d+[\.,]\d+)\s*kg", clean_line, re.IGNORECASE)
+        if kg_match:
+            try:
+                return float(kg_match.group(1).replace(",", "."))
+            except ValueError:
+                pass
+
+        # 2. Regla Secundaria: Si la trama no trae 'kg', tomar estrictamente el PRIMER número de la línea
+        # (El primer número es SIEMPRE el peso en la pantalla LCD de la BBG Market 30)
+        first_num_match = re.search(r"[-+]?\s*(\d+[\.,]\d+)", clean_line)
+        if first_num_match:
+            try:
+                return float(first_num_match.group(1).replace(",", "."))
+            except ValueError:
+                pass
+
+    return None
+
 class ScaleBridgeApp:
     def __init__(self):
         self.config = load_config()
         self.current_weight = "0.000"
         self.is_scale_on = False
-        self.active_port_name = self.config.get("port", "COM2")
+        self.active_port_name = self.config.get("port", "COM1")
         self.status_detail = "CONECTANDO A BÁSCULA..."
         self.running = True
         self.last_injection_time = 0
@@ -115,7 +150,7 @@ class ScaleBridgeApp:
         self.pynput_listener = None
         self.reconnect_requested = False
 
-        # Hilo de lectura estable con filtro anti-parpadeo
+        # Hilo de lectura estable con parser BBG de precisión
         self.serial_thread = threading.Thread(target=self._realtime_hardware_worker, daemon=True)
         self.serial_thread.start()
 
@@ -187,7 +222,7 @@ class ScaleBridgeApp:
                 self.active_ser = None
 
     def _get_ports_to_scan(self):
-        preferred_port = self.config.get("port", "COM2")
+        preferred_port = self.config.get("port", "COM1")
         ports_list = [preferred_port]
 
         if serial and hasattr(serial, "tools") and hasattr(serial.tools, "list_ports"):
@@ -207,7 +242,7 @@ class ScaleBridgeApp:
         return ports_list
 
     def _realtime_hardware_worker(self):
-        """Monitorea el puerto COM con filtro antirrebote de estabilidad y latch de peso."""
+        """Monitorea el puerto COM con parser exacto de pantalla de BBG Market 30."""
         baudrates = [self.config.get("baudrate", 9600), 9600, 2400, 4800]
         baudrates = list(dict.fromkeys(baudrates))
 
@@ -263,44 +298,39 @@ class ScaleBridgeApp:
                                         decoded = raw_bytes.decode("latin-1", errors="ignore")
                                         buffer_str += decoded
 
-                                        matches = re.findall(r"[-+]?\s*(\d+[\.,]\d+|\d+)", buffer_str)
-                                        if matches:
-                                            latest_raw = matches[-1].replace(",", ".")
-                                            try:
-                                                val_float = float(latest_raw)
-                                                if val_float >= 0.005:
-                                                    consecutive_zeros = 0
-                                                    formatted = f"{val_float:.3f}"
+                                        val_float = parse_bbg_primary_weight(buffer_str)
+                                        if val_float is not None:
+                                            if val_float >= 0.005:
+                                                consecutive_zeros = 0
+                                                formatted = f"{val_float:.3f}"
+                                                with self.lock:
+                                                    self.current_weight = formatted
+                                                    self.is_scale_on = True
+                                                    self.status_detail = f"ENCENDIDA ({port_name})"
+                                            else:
+                                                consecutive_zeros += 1
+                                                if consecutive_zeros >= 3:
                                                     with self.lock:
-                                                        self.current_weight = formatted
+                                                        self.current_weight = "0.000"
                                                         self.is_scale_on = True
                                                         self.status_detail = f"ENCENDIDA ({port_name})"
-                                                else:
-                                                    consecutive_zeros += 1
-                                                    if consecutive_zeros >= 4:
-                                                        with self.lock:
-                                                            self.current_weight = "0.000"
-                                                            self.is_scale_on = True
-                                                            self.status_detail = f"ENCENDIDA ({port_name})"
 
-                                                found_scale_on_port = True
-                                                last_valid_data_time = time.time()
-                                                buffer_str = ""
+                                            found_scale_on_port = True
+                                            last_valid_data_time = time.time()
+                                            buffer_str = ""
 
-                                                if self.config.get("port") != port_name or self.config.get("baudrate") != baud:
-                                                    self.config["port"] = port_name
-                                                    self.config["baudrate"] = baud
-                                                    save_config(self.config)
-                                            except ValueError:
-                                                pass
+                                            if self.config.get("port") != port_name or self.config.get("baudrate") != baud:
+                                                self.config["port"] = port_name
+                                                self.config["baudrate"] = baud
+                                                save_config(self.config)
                                 except Exception as read_err:
                                     print(f"Error comprobando {port_name}: {read_err}")
                                     break
                             time.sleep(0.02)
 
-                        # Bucle principal de lectura constante con FILTRO ANTI-PARPADEO
+                        # Bucle principal de lectura constante con PARSER BBG FIJO
                         if found_scale_on_port:
-                            print(f"¡Báscula transmitiendo estable en {port_name}!")
+                            print(f"¡Báscula BBG transmitiendo en {port_name}!")
                             
                             while self.running and not self.reconnect_requested:
                                 if self.active_ser and self.active_ser.is_open:
@@ -313,41 +343,34 @@ class ScaleBridgeApp:
                                             decoded = raw_bytes.decode("latin-1", errors="ignore")
                                             buffer_str += decoded
 
-                                            matches = re.findall(r"[-+]?\s*(\d+[\.,]\d+|\d+)", buffer_str)
-                                            if matches:
-                                                latest_raw = matches[-1].replace(",", ".")
-                                                try:
-                                                    val_float = float(latest_raw)
-                                                    
-                                                    # FILTRO ANTI-PARPADEO / DEBOUNCE:
-                                                    # Si llega un peso mayor o igual a 5 gramos, fijar peso y reiniciar contador de ceros.
-                                                    if val_float >= 0.005:
-                                                        consecutive_zeros = 0
-                                                        formatted = f"{val_float:.3f}"
+                                            val_float = parse_bbg_primary_weight(buffer_str)
+                                            if val_float is not None:
+                                                # SI EL PESO ES MAYOR A 5 GRAMOS (Objeto en la báscula):
+                                                if val_float >= 0.005:
+                                                    consecutive_zeros = 0
+                                                    formatted = f"{val_float:.3f}"
+                                                    with self.lock:
+                                                        self.current_weight = formatted
+                                                        self.is_scale_on = True
+                                                        self.status_detail = f"ENCENDIDA ({port_name})"
+                                                else:
+                                                    # SI LLEGA LECTURA DE CERO (Objeto retirado):
+                                                    # Se requieren 3 lecturas seguidas de cero para confirmar el reseteo
+                                                    consecutive_zeros += 1
+                                                    if consecutive_zeros >= 3:
                                                         with self.lock:
-                                                            self.current_weight = formatted
+                                                            self.current_weight = "0.000"
                                                             self.is_scale_on = True
                                                             self.status_detail = f"ENCENDIDA ({port_name})"
-                                                    else:
-                                                        # Si llega una trama intercalada de cero, incrementar contador.
-                                                        # ÚNICAMENTE tras 4 ceros seguidos se confirma que se retiró el objeto de la báscula.
-                                                        consecutive_zeros += 1
-                                                        if consecutive_zeros >= 4:
-                                                            with self.lock:
-                                                                self.current_weight = "0.000"
-                                                                self.is_scale_on = True
-                                                                self.status_detail = f"ENCENDIDA ({port_name})"
 
-                                                    last_valid_data_time = time.time()
-                                                    buffer_str = ""
-                                                except ValueError:
-                                                    pass
+                                                last_valid_data_time = time.time()
+                                                buffer_str = ""
                                     except Exception as err:
                                         print(f"Error de lectura serial: {err}")
                                         break
 
                                 now = time.time()
-                                # Si pasan más de 4 segundos sin señal, marcar como apagada
+                                # Si pasan más de 4.0 segundos sin recibir tramas seriales, marcar como APAGADA
                                 if now - last_valid_data_time > 4.0:
                                     with self.lock:
                                         self.is_scale_on = False
@@ -470,7 +493,7 @@ class ScaleBridgeApp:
 
         self.lbl_status_text = tk.Label(
             self.frame,
-            text="CONECTANDO A COM2...",
+            text="CONECTANDO A BÁSCULA...",
             font=("Segoe UI", 7, "bold"),
             fg="#EAB308",
             bg=bg_color
