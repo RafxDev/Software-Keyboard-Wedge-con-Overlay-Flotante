@@ -9,6 +9,7 @@ import tkinter as tk
 
 try:
     import serial
+    import serial.tools.list_ports
 except ImportError:
     serial = None
 
@@ -105,6 +106,8 @@ class ScaleBridgeApp:
         self.config = load_config()
         self.current_weight = "0.000"
         self.is_scale_on = False
+        self.active_port_name = "COM1"
+        self.status_detail = "BUSCANDO BÁSCULA..."
         self.running = True
         self.last_injection_time = 0
         self.lock = threading.Lock()
@@ -112,8 +115,8 @@ class ScaleBridgeApp:
         self.pynput_listener = None
         self.reconnect_requested = False
 
-        # Hilo 100% hardware de monitoreo continuo
-        self.serial_thread = threading.Thread(target=self._serial_hardware_worker, daemon=True)
+        # Hilo de escaneo y lectura continua de báscula física
+        self.serial_thread = threading.Thread(target=self._hardware_auto_scanner, daemon=True)
         self.serial_thread.start()
 
         # Configurar Hotkey global (F2)
@@ -163,12 +166,12 @@ class ScaleBridgeApp:
         self._inject_weight()
 
     def _retry_rs232_connection(self):
-        """Forzar reconexión limpia al puerto de la báscula."""
-        port = self.config.get("port", "COM1")
-        print(f"Buscando báscula en el puerto {port}...")
+        """Forzar escaneo y reconexión inmediata de puertos."""
+        print("Forzando escaneo completo de puertos COM...")
         with self.lock:
             self.reconnect_requested = True
             self.is_scale_on = False
+            self.status_detail = "BUSCANDO BÁSCULA..."
 
         if hasattr(self, "canvas_status"):
             self.canvas_status.itemconfig(self.status_dot, fill="#EAB308")
@@ -183,9 +186,33 @@ class ScaleBridgeApp:
             finally:
                 self.active_ser = None
 
-    def _serial_hardware_worker(self):
-        """Hilo de lectura 100% Hardware: Monitorea si la báscula está ENCENDIDA o APAGADA."""
-        buffer_str = ""
+    def _get_ports_to_scan(self):
+        """Obtiene lista de puertos COM a probar en orden de prioridad."""
+        preferred_port = self.config.get("port", "COM1")
+        ports_list = [preferred_port]
+
+        if serial and hasattr(serial, "tools") and hasattr(serial.tools, "list_ports"):
+            try:
+                detected = [p.device for p in serial.tools.list_ports.comports()]
+                for d in detected:
+                    if d not in ports_list:
+                        ports_list.append(d)
+            except Exception:
+                pass
+
+        # Agregar rangos COM1 a COM15 de respaldo
+        for i in range(1, 16):
+            cp = f"COM{i}"
+            if cp not in ports_list:
+                ports_list.append(cp)
+
+        return ports_list
+
+    def _hardware_auto_scanner(self):
+        """Monitorea los puertos COM y detecta automáticamente cuando la báscula está ENCENDIDA o APAGADA."""
+        baudrates = [self.config.get("baudrate", 9600), 9600, 2400, 4800, 19200]
+        # Eliminar duplicados manteniendo orden
+        baudrates = list(dict.fromkeys(baudrates))
 
         while self.running:
             with self.lock:
@@ -193,79 +220,145 @@ class ScaleBridgeApp:
                 if reconnect:
                     self.reconnect_requested = False
 
-            port = self.config.get("port", "COM1")
-            baudrate = self.config.get("baudrate", 9600)
+            ports_to_try = self._get_ports_to_scan()
+            connected_and_reading = False
 
-            if not serial:
-                with self.lock:
-                    self.is_scale_on = False
-                time.sleep(2)
-                continue
+            for port_name in ports_to_try:
+                if not self.running or self.reconnect_requested:
+                    break
 
-            self._close_active_serial()
+                for baud in baudrates:
+                    if not self.running or self.reconnect_requested:
+                        break
 
-            try:
-                print(f"Abriendo puerto {port} ({baudrate} baudios)...")
-                self.active_ser = serial.Serial(
-                    port=port,
-                    baudrate=baudrate,
-                    bytesize=serial.EIGHTBITS,
-                    parity=serial.PARITY_NONE,
-                    stopbits=serial.STOPBITS_ONE,
-                    timeout=0.1
-                )
-                
-                buffer_str = ""
-                last_frame_recv_time = time.time()
+                    self._close_active_serial()
+                    try:
+                        with self.lock:
+                            self.status_detail = f"PROBANDO {port_name} ({baud})..."
 
-                # Lectura continua mientras el puerto esté abierto
-                while self.running and not self.reconnect_requested:
-                    if self.active_ser and self.active_ser.is_open:
-                        try:
-                            waiting = self.active_ser.in_waiting
-                            if waiting > 0:
-                                raw_bytes = self.active_ser.read(waiting)
-                                decoded = raw_bytes.decode("latin-1", errors="ignore")
-                                buffer_str += decoded
+                        self.active_ser = serial.Serial(
+                            port=port_name,
+                            baudrate=baud,
+                            bytesize=serial.EIGHTBITS,
+                            parity=serial.PARITY_NONE,
+                            stopbits=serial.STOPBITS_ONE,
+                            timeout=0.1
+                        )
 
-                                frames = re.split(r"[\r\n]+", buffer_str)
-                                buffer_str = frames[-1] if len(frames) > 1 else buffer_str
-                                complete_frames = frames[:-1] if len(frames) > 1 else []
+                        buffer_str = ""
+                        last_data_time = time.time()
+                        has_received_valid_frame = False
 
-                                if complete_frames:
-                                    latest_frame = complete_frames[-1].strip()
-                                    if latest_frame:
-                                        match = re.search(r"[-+]?\s*(\d+[\.,]\d+|\d+)", latest_frame)
-                                        if match:
-                                            raw_val = match.group(1).replace(",", ".")
-                                            try:
-                                                val_float = float(raw_val)
-                                                formatted = f"{val_float:.3f}"
-                                                with self.lock:
-                                                    self.current_weight = formatted
-                                                    self.is_scale_on = True
-                                                    last_frame_recv_time = time.time()
-                                            except ValueError:
-                                                pass
+                        # Escuchar este puerto por hasta 1.5 segundos para ver si transmite datos de peso
+                        start_listen = time.time()
+                        while self.running and not self.reconnect_requested and (time.time() - start_listen < 1.5):
+                            if self.active_ser and self.active_ser.is_open:
+                                try:
+                                    waiting = self.active_ser.in_waiting
+                                    if waiting > 0:
+                                        raw_bytes = self.active_ser.read(waiting)
+                                        decoded = raw_bytes.decode("latin-1", errors="ignore")
+                                        buffer_str += decoded
+                                        last_data_time = time.time()
 
-                        except Exception as read_err:
-                            print(f"Error de lectura serial: {read_err}")
+                                        frames = re.split(r"[\r\n]+", buffer_str)
+                                        buffer_str = frames[-1] if len(frames) > 1 else buffer_str
+                                        complete_frames = frames[:-1] if len(frames) > 1 else []
+
+                                        if complete_frames:
+                                            latest_frame = complete_frames[-1].strip()
+                                            if latest_frame:
+                                                match = re.search(r"[-+]?\s*(\d+[\.,]\d+|\d+)", latest_frame)
+                                                if match:
+                                                    raw_val = match.group(1).replace(",", ".")
+                                                    try:
+                                                        val_float = float(raw_val)
+                                                        formatted = f"{val_float:.3f}"
+                                                        with self.lock:
+                                                            self.current_weight = formatted
+                                                            self.is_scale_on = True
+                                                            self.active_port_name = port_name
+                                                            self.status_detail = f"ENCENDIDA ({port_name})"
+                                                        has_received_valid_frame = True
+                                                        
+                                                        # Guardar automáticamente el puerto funcional en config.json
+                                                        if self.config.get("port") != port_name or self.config.get("baudrate") != baud:
+                                                            self.config["port"] = port_name
+                                                            self.config["baudrate"] = baud
+                                                            save_config(self.config)
+                                                    except ValueError:
+                                                        pass
+                                except Exception as read_err:
+                                    print(f"Error leyendo {port_name}: {read_err}")
+                                    break
+
+                            if has_received_valid_frame:
+                                # Extender el tiempo de escucha mientras siga enviando datos
+                                start_listen = time.time()
+
+                            time.sleep(0.03)
+
+                        # Si este puerto está transmitiendo activamente, mantener el bucle en él
+                        if has_received_valid_frame:
+                            print(f"¡Báscula conectada y transmitiendo en {port_name} a {baud} baudios!")
+                            
+                            # Bucle continuo mientras la báscula siga encendida y transmitiendo datos
+                            while self.running and not self.reconnect_requested:
+                                if self.active_ser and self.active_ser.is_open:
+                                    try:
+                                        waiting = self.active_ser.in_waiting
+                                        if waiting > 0:
+                                            raw_bytes = self.active_ser.read(waiting)
+                                            decoded = raw_bytes.decode("latin-1", errors="ignore")
+                                            buffer_str += decoded
+                                            last_data_time = time.time()
+
+                                            frames = re.split(r"[\r\n]+", buffer_str)
+                                            buffer_str = frames[-1] if len(frames) > 1 else buffer_str
+                                            complete_frames = frames[:-1] if len(frames) > 1 else []
+
+                                            if complete_frames:
+                                                latest_frame = complete_frames[-1].strip()
+                                                if latest_frame:
+                                                    match = re.search(r"[-+]?\s*(\d+[\.,]\d+|\d+)", latest_frame)
+                                                    if match:
+                                                        raw_val = match.group(1).replace(",", ".")
+                                                        try:
+                                                            val_float = float(raw_val)
+                                                            formatted = f"{val_float:.3f}"
+                                                            with self.lock:
+                                                                self.current_weight = formatted
+                                                                self.is_scale_on = True
+                                                                self.status_detail = f"ENCENDIDA ({port_name})"
+                                                        except ValueError:
+                                                            pass
+                                    except Exception as err:
+                                        print(f"Pérdida de señal en {port_name}: {err}")
+                                        break
+
+                                # Si se apaga la báscula o deja de enviar datos por más de 2.0 segundos
+                                if time.time() - last_data_time > 2.0:
+                                    print(f"Báscula en {port_name} dejó de enviar datos (Báscula Apagada).")
+                                    with self.lock:
+                                        self.is_scale_on = False
+                                        self.status_detail = f"APAGADA ({port_name})"
+                                    break
+
+                                time.sleep(0.03)
+
+                            connected_and_reading = True
                             break
 
-                    # Si pasan más de 2 segundos sin señal/trama de la báscula, se marca como APAGADA
-                    if time.time() - last_frame_recv_time > 2.0:
-                        with self.lock:
-                            self.is_scale_on = False
+                        self._close_active_serial()
 
-                    time.sleep(0.03)
+                    except Exception as e:
+                        self._close_active_serial()
 
-                self._close_active_serial()
-
-            except Exception as e:
-                self._close_active_serial()
+            # Si se recorrieron todos los puertos sin detectar báscula prendida
+            if not connected_and_reading:
                 with self.lock:
                     self.is_scale_on = False
-
+                    self.status_detail = "APAGADA / DESCONECTADA"
                 time.sleep(2.0)
 
     def _inject_weight(self):
@@ -368,9 +461,9 @@ class ScaleBridgeApp:
 
         self.lbl_status_text = tk.Label(
             self.frame,
-            text="APAGADA / DESCONECTADA",
+            text="BUSCANDO BÁSCULA...",
             font=("Segoe UI", 7, "bold"),
-            fg="#EF4444",
+            fg="#EAB308",
             bg=bg_color
         )
         self.lbl_status_text.pack(pady=(0, 2))
@@ -385,7 +478,7 @@ class ScaleBridgeApp:
             widget.bind("<Double-Button-1>", lambda e: self._inject_weight())
 
         self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label="🔌 Reconectar Puerto RS-232 (COM)", command=self._retry_rs232_connection)
+        self.context_menu.add_command(label="🔌 Escanear y Reconectar Puerto RS-232", command=self._retry_rs232_connection)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="❌ Salir", command=self._quit_app)
 
@@ -426,15 +519,17 @@ class ScaleBridgeApp:
         with self.lock:
             weight = self.current_weight
             is_scale_on = self.is_scale_on
+            status_text = self.status_detail
 
         if is_scale_on:
             self.lbl_weight.config(text=f"{weight} kg", fg="#22C55E")
-            self.lbl_status_text.config(text="ENCENDIDA / CONECTADA", fg="#22C55E")
+            self.lbl_status_text.config(text=status_text, fg="#22C55E")
             self.canvas_status.itemconfig(self.status_dot, fill="#22C55E")
         else:
             self.lbl_weight.config(text="--- kg", fg="#64748B")
-            self.lbl_status_text.config(text="APAGADA / DESCONECTADA", fg="#EF4444")
-            self.canvas_status.itemconfig(self.status_dot, fill="#EF4444")
+            self.lbl_status_text.config(text=status_text, fg="#EF4444" if "APAGADA" in status_text else "#EAB308")
+            dot_color = "#EF4444" if "APAGADA" in status_text else "#EAB308"
+            self.canvas_status.itemconfig(self.status_dot, fill=dot_color)
 
         self.root.after(40, self._update_hud_loop)
 

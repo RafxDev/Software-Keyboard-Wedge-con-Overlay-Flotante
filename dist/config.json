@@ -1,5 +1,5 @@
 {
-  "port": "COM1",
+  "port": "COM2",
   "baudrate": 9600,
   "trigger_key": "f2",
   "decimal_separator": ".",
