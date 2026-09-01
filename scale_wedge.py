@@ -115,7 +115,7 @@ class ScaleBridgeApp:
         self.pynput_listener = None
         self.reconnect_requested = False
 
-        # Hilo de lectura estable en tiempo real
+        # Hilo de lectura estable con filtro anti-parpadeo
         self.serial_thread = threading.Thread(target=self._realtime_hardware_worker, daemon=True)
         self.serial_thread.start()
 
@@ -207,9 +207,11 @@ class ScaleBridgeApp:
         return ports_list
 
     def _realtime_hardware_worker(self):
-        """Monitorea el puerto COM manteniendo el peso ESTABLE sin parpadeos a cero mientras haya un objeto."""
+        """Monitorea el puerto COM con filtro antirrebote de estabilidad y latch de peso."""
         baudrates = [self.config.get("baudrate", 9600), 9600, 2400, 4800]
         baudrates = list(dict.fromkeys(baudrates))
+
+        consecutive_zeros = 0
 
         while self.running:
             with self.lock:
@@ -248,7 +250,7 @@ class ScaleBridgeApp:
                         last_valid_data_time = time.time()
                         found_scale_on_port = False
 
-                        # Prueba inicial de 1 segundo para verificar datos activos
+                        # Bucle de prueba de puerto
                         start_test = time.time()
                         while self.running and not self.reconnect_requested and (time.time() - start_test < 1.0):
                             if self.active_ser and self.active_ser.is_open:
@@ -266,11 +268,21 @@ class ScaleBridgeApp:
                                             latest_raw = matches[-1].replace(",", ".")
                                             try:
                                                 val_float = float(latest_raw)
-                                                formatted = "0.000" if val_float < 0.005 else f"{val_float:.3f}"
-                                                with self.lock:
-                                                    self.current_weight = formatted
-                                                    self.is_scale_on = True
-                                                    self.status_detail = f"ENCENDIDA ({port_name})"
+                                                if val_float >= 0.005:
+                                                    consecutive_zeros = 0
+                                                    formatted = f"{val_float:.3f}"
+                                                    with self.lock:
+                                                        self.current_weight = formatted
+                                                        self.is_scale_on = True
+                                                        self.status_detail = f"ENCENDIDA ({port_name})"
+                                                else:
+                                                    consecutive_zeros += 1
+                                                    if consecutive_zeros >= 4:
+                                                        with self.lock:
+                                                            self.current_weight = "0.000"
+                                                            self.is_scale_on = True
+                                                            self.status_detail = f"ENCENDIDA ({port_name})"
+
                                                 found_scale_on_port = True
                                                 last_valid_data_time = time.time()
                                                 buffer_str = ""
@@ -286,7 +298,7 @@ class ScaleBridgeApp:
                                     break
                             time.sleep(0.02)
 
-                        # Bucle principal: mantiene el peso constante y solo regresa a 0 al recibir 0 o al retirar el objeto
+                        # Bucle principal de lectura constante con FILTRO ANTI-PARPADEO
                         if found_scale_on_port:
                             print(f"¡Báscula transmitiendo estable en {port_name}!")
                             
@@ -306,16 +318,26 @@ class ScaleBridgeApp:
                                                 latest_raw = matches[-1].replace(",", ".")
                                                 try:
                                                     val_float = float(latest_raw)
-                                                    # Umbral de cero: si la lectura enviada es menor a 5 gramos (0.005 kg), mostrar 0.000
-                                                    if val_float < 0.005:
-                                                        formatted = "0.000"
-                                                    else:
+                                                    
+                                                    # FILTRO ANTI-PARPADEO / DEBOUNCE:
+                                                    # Si llega un peso mayor o igual a 5 gramos, fijar peso y reiniciar contador de ceros.
+                                                    if val_float >= 0.005:
+                                                        consecutive_zeros = 0
                                                         formatted = f"{val_float:.3f}"
+                                                        with self.lock:
+                                                            self.current_weight = formatted
+                                                            self.is_scale_on = True
+                                                            self.status_detail = f"ENCENDIDA ({port_name})"
+                                                    else:
+                                                        # Si llega una trama intercalada de cero, incrementar contador.
+                                                        # ÚNICAMENTE tras 4 ceros seguidos se confirma que se retiró el objeto de la báscula.
+                                                        consecutive_zeros += 1
+                                                        if consecutive_zeros >= 4:
+                                                            with self.lock:
+                                                                self.current_weight = "0.000"
+                                                                self.is_scale_on = True
+                                                                self.status_detail = f"ENCENDIDA ({port_name})"
 
-                                                    with self.lock:
-                                                        self.current_weight = formatted
-                                                        self.is_scale_on = True
-                                                        self.status_detail = f"ENCENDIDA ({port_name})"
                                                     last_valid_data_time = time.time()
                                                     buffer_str = ""
                                                 except ValueError:
@@ -325,7 +347,7 @@ class ScaleBridgeApp:
                                         break
 
                                 now = time.time()
-                                # Si transcurren más de 4.0 segundos sin recibir datos por el puerto, marcar como APAGADA
+                                # Si pasan más de 4 segundos sin señal, marcar como apagada
                                 if now - last_valid_data_time > 4.0:
                                     with self.lock:
                                         self.is_scale_on = False
