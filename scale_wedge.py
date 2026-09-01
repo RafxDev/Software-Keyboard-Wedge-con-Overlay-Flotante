@@ -103,36 +103,43 @@ def save_config(config):
 
 def parse_bbg_primary_weight(buffer_str):
     """
-    Parser especializado para básculas BBG Market 30 / IPBG.
-    Extrae ÚNICA Y EXCLUSIVAMENTE el primer valor correspondiente al PESO en pantalla,
-    ignorando campos secundarios como tara, precio unitario o código de estado.
+    Parser especializado para BBG Market 30 / IPBG.
+    Si la báscula transmite tramas con Peso Neto (NT) y Peso Bruto (GS),
+    prioriza Peso Neto (NT) o la primera lectura de peso.
     """
     if not buffer_str or not buffer_str.strip():
         return None
 
     lines = re.split(r"[\r\n]+", buffer_str)
-    # Analizar de la trama más reciente hacia atrás
+    
+    # 1. Buscar si hay trama explícita de Peso Neto (NT / NET)
     for line in reversed(lines):
         clean_line = line.strip()
-        if not clean_line:
-            continue
+        if "NT" in clean_line.upper() or "NET" in clean_line.upper():
+            kg_match = re.search(r"[-+]?\s*(\d+[\.,]\d+)", clean_line)
+            if kg_match:
+                try:
+                    return float(kg_match.group(1).replace(",", "."))
+                except ValueError:
+                    pass
 
-        # 1. Regla Principal: Buscar la cifra asociada explícitamente a 'kg' (ej. +0.120kg o 0.120 kg)
-        kg_match = re.search(r"[-+]?\s*(\d+[\.,]\d+)\s*kg", clean_line, re.IGNORECASE)
-        if kg_match:
-            try:
-                return float(kg_match.group(1).replace(",", "."))
-            except ValueError:
-                pass
+    # 2. Si no hay NT, tomar la cifra principal asociada a kg o primer número
+    for line in reversed(lines):
+        clean_line = line.strip()
+        if clean_line:
+            kg_match = re.search(r"[-+]?\s*(\d+[\.,]\d+)\s*kg", clean_line, re.IGNORECASE)
+            if kg_match:
+                try:
+                    return float(kg_match.group(1).replace(",", "."))
+                except ValueError:
+                    pass
 
-        # 2. Regla Secundaria: Si la trama no trae 'kg', tomar estrictamente el PRIMER número de la línea
-        # (El primer número es SIEMPRE el peso en la pantalla LCD de la BBG Market 30)
-        first_num_match = re.search(r"[-+]?\s*(\d+[\.,]\d+)", clean_line)
-        if first_num_match:
-            try:
-                return float(first_num_match.group(1).replace(",", "."))
-            except ValueError:
-                pass
+            first_num_match = re.search(r"[-+]?\s*(\d+[\.,]\d+)", clean_line)
+            if first_num_match:
+                try:
+                    return float(first_num_match.group(1).replace(",", "."))
+                except ValueError:
+                    pass
 
     return None
 
@@ -150,7 +157,7 @@ class ScaleBridgeApp:
         self.pynput_listener = None
         self.reconnect_requested = False
 
-        # Hilo de lectura estable con parser BBG de precisión
+        # Hilo de lectura estable con Filtro de Histeresis y Bloqueo de Modo
         self.serial_thread = threading.Thread(target=self._realtime_hardware_worker, daemon=True)
         self.serial_thread.start()
 
@@ -242,11 +249,14 @@ class ScaleBridgeApp:
         return ports_list
 
     def _realtime_hardware_worker(self):
-        """Monitorea el puerto COM con parser exacto de pantalla de BBG Market 30."""
+        """Monitorea el puerto COM con filtro de histéresis y bloqueo de fluctuación Bruto/Neto."""
         baudrates = [self.config.get("baudrate", 9600), 9600, 2400, 4800]
         baudrates = list(dict.fromkeys(baudrates))
 
         consecutive_zeros = 0
+        active_locked_weight = 0.0
+        pending_weight = None
+        pending_count = 0
 
         while self.running:
             with self.lock:
@@ -300,21 +310,6 @@ class ScaleBridgeApp:
 
                                         val_float = parse_bbg_primary_weight(buffer_str)
                                         if val_float is not None:
-                                            if val_float >= 0.005:
-                                                consecutive_zeros = 0
-                                                formatted = f"{val_float:.3f}"
-                                                with self.lock:
-                                                    self.current_weight = formatted
-                                                    self.is_scale_on = True
-                                                    self.status_detail = f"ENCENDIDA ({port_name})"
-                                            else:
-                                                consecutive_zeros += 1
-                                                if consecutive_zeros >= 3:
-                                                    with self.lock:
-                                                        self.current_weight = "0.000"
-                                                        self.is_scale_on = True
-                                                        self.status_detail = f"ENCENDIDA ({port_name})"
-
                                             found_scale_on_port = True
                                             last_valid_data_time = time.time()
                                             buffer_str = ""
@@ -328,7 +323,7 @@ class ScaleBridgeApp:
                                     break
                             time.sleep(0.02)
 
-                        # Bucle principal de lectura constante con PARSER BBG FIJO
+                        # Bucle principal de lectura constante con FILTRO DE HISTÉRESIS
                         if found_scale_on_port:
                             print(f"¡Báscula BBG transmitiendo en {port_name}!")
                             
@@ -345,26 +340,47 @@ class ScaleBridgeApp:
 
                                             val_float = parse_bbg_primary_weight(buffer_str)
                                             if val_float is not None:
-                                                # SI EL PESO ES MAYOR A 5 GRAMOS (Objeto en la báscula):
-                                                if val_float >= 0.005:
-                                                    consecutive_zeros = 0
-                                                    formatted = f"{val_float:.3f}"
-                                                    with self.lock:
-                                                        self.current_weight = formatted
-                                                        self.is_scale_on = True
-                                                        self.status_detail = f"ENCENDIDA ({port_name})"
-                                                else:
-                                                    # SI LLEGA LECTURA DE CERO (Objeto retirado):
-                                                    # Se requieren 3 lecturas seguidas de cero para confirmar el reseteo
+                                                last_valid_data_time = time.time()
+                                                buffer_str = ""
+
+                                                if val_float < 0.005:
                                                     consecutive_zeros += 1
                                                     if consecutive_zeros >= 3:
+                                                        active_locked_weight = 0.0
+                                                        pending_weight = None
+                                                        pending_count = 0
                                                         with self.lock:
                                                             self.current_weight = "0.000"
                                                             self.is_scale_on = True
                                                             self.status_detail = f"ENCENDIDA ({port_name})"
+                                                else:
+                                                    consecutive_zeros = 0
 
-                                                last_valid_data_time = time.time()
-                                                buffer_str = ""
+                                                    # FILTRO DE HISTÉRESIS DE HISTOGRAMA:
+                                                    # Si la variación entre tramas es menor a 35 gramos (ej: 0.120 vs 0.100),
+                                                    # se bloquea la lectura en el peso bloqueado original para evitar parpadeos Bruto/Neto.
+                                                    if active_locked_weight > 0.005 and abs(val_float - active_locked_weight) < 0.035:
+                                                        formatted = f"{active_locked_weight:.3f}"
+                                                        with self.lock:
+                                                            self.current_weight = formatted
+                                                            self.is_scale_on = True
+                                                            self.status_detail = f"ENCENDIDA ({port_name})"
+                                                    else:
+                                                        # Si hay un cambio real de peso (ej: nuevo objeto), requiere confirmación rápida
+                                                        if pending_weight is not None and abs(val_float - pending_weight) < 0.005:
+                                                            pending_count += 1
+                                                        else:
+                                                            pending_weight = val_float
+                                                            pending_count = 1
+
+                                                        if pending_count >= 2 or active_locked_weight == 0.0:
+                                                            active_locked_weight = pending_weight
+                                                            formatted = f"{active_locked_weight:.3f}"
+                                                            with self.lock:
+                                                                self.current_weight = formatted
+                                                                self.is_scale_on = True
+                                                                self.status_detail = f"ENCENDIDA ({port_name})"
+
                                     except Exception as err:
                                         print(f"Error de lectura serial: {err}")
                                         break
