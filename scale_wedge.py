@@ -6,7 +6,6 @@ import time
 import threading
 import ctypes
 import tkinter as tk
-from tkinter import messagebox
 
 try:
     import serial
@@ -26,15 +25,14 @@ except ImportError:
 CONFIG_FILE = "config.json"
 
 DEFAULT_CONFIG = {
-    "port": "COM3",
+    "scale_model": "BBG Market 30 / IPBG",
+    "port": "COM1",
     "baudrate": 9600,
     "trigger_key": "f2",
     "decimal_separator": ".",
     "hud_position": "+1150+20",
-    "hud_width": 210,
-    "hud_height": 75,
-    "mock_mode": False,
-    "auto_mock_on_error": True
+    "hud_width": 220,
+    "hud_height": 80
 }
 
 def ensure_single_instance():
@@ -106,9 +104,7 @@ class ScaleBridgeApp:
     def __init__(self):
         self.config = load_config()
         self.current_weight = "0.000"
-        self.status_msg = "Inicializando..."
-        self.is_connected = False
-        self.is_mock = self.config.get("mock_mode", False)
+        self.is_scale_on = False
         self.running = True
         self.last_injection_time = 0
         self.lock = threading.Lock()
@@ -116,14 +112,11 @@ class ScaleBridgeApp:
         self.pynput_listener = None
         self.reconnect_requested = False
 
-        if self.is_mock:
-            self.current_weight = "1.450"
-
-        # Iniciar hilo de lectura serial en tiempo real
-        self.serial_thread = threading.Thread(target=self._serial_worker, daemon=True)
+        # Hilo 100% hardware de monitoreo continuo
+        self.serial_thread = threading.Thread(target=self._serial_hardware_worker, daemon=True)
         self.serial_thread.start()
 
-        # Configurar Hotkey global
+        # Configurar Hotkey global (F2)
         self._setup_hotkey()
 
         # Crear Interfaz Gráfica (Tkinter)
@@ -170,14 +163,12 @@ class ScaleBridgeApp:
         self._inject_weight()
 
     def _retry_rs232_connection(self):
-        """Fuerza reconexión limpia al puerto RS-232 en tiempo real."""
-        port = self.config.get("port", "COM3")
-        print(f"Fuerza reconexión al puerto RS-232 {port}...")
+        """Forzar reconexión limpia al puerto de la báscula."""
+        port = self.config.get("port", "COM1")
+        print(f"Buscando báscula en el puerto {port}...")
         with self.lock:
-            self.is_mock = False
             self.reconnect_requested = True
-            self.status_msg = f"Conectando {port}..."
-            self.is_connected = False
+            self.is_scale_on = False
 
         if hasattr(self, "canvas_status"):
             self.canvas_status.itemconfig(self.status_dot, fill="#EAB308")
@@ -192,39 +183,29 @@ class ScaleBridgeApp:
             finally:
                 self.active_ser = None
 
-    def _serial_worker(self):
-        """Hilo dedicado a la lectura e interpretación en TIEMPO REAL del puerto serial RS-232."""
+    def _serial_hardware_worker(self):
+        """Hilo de lectura 100% Hardware: Monitorea si la báscula está ENCENDIDA o APAGADA."""
         buffer_str = ""
 
         while self.running:
             with self.lock:
-                is_mock = self.is_mock
                 reconnect = self.reconnect_requested
                 if reconnect:
                     self.reconnect_requested = False
 
-            if is_mock and not reconnect:
-                self._close_active_serial()
-                with self.lock:
-                    self.status_msg = "Modo Simulación"
-                    self.is_connected = True
-                time.sleep(0.2)
-                continue
-
-            port = self.config.get("port", "COM3")
+            port = self.config.get("port", "COM1")
             baudrate = self.config.get("baudrate", 9600)
 
             if not serial:
                 with self.lock:
-                    self.status_msg = "pyserial no instalado"
-                    self.is_connected = False
-                    self.is_mock = True
+                    self.is_scale_on = False
                 time.sleep(2)
                 continue
 
             self._close_active_serial()
+
             try:
-                print(f"Conectando al puerto {port} ({baudrate} baudios)...")
+                print(f"Abriendo puerto {port} ({baudrate} baudios)...")
                 self.active_ser = serial.Serial(
                     port=port,
                     baudrate=baudrate,
@@ -234,15 +215,11 @@ class ScaleBridgeApp:
                     timeout=0.1
                 )
                 
-                with self.lock:
-                    self.status_msg = f"Conectado ({port})"
-                    self.is_connected = True
-                    self.is_mock = False
-
                 buffer_str = ""
+                last_frame_recv_time = time.time()
 
-                # Bucle de lectura de alta frecuencia en tiempo real (50ms por iteración)
-                while self.running and not self.is_mock and not self.reconnect_requested:
+                # Lectura continua mientras el puerto esté abierto
+                while self.running and not self.reconnect_requested:
                     if self.active_ser and self.active_ser.is_open:
                         try:
                             waiting = self.active_ser.in_waiting
@@ -251,25 +228,13 @@ class ScaleBridgeApp:
                                 decoded = raw_bytes.decode("latin-1", errors="ignore")
                                 buffer_str += decoded
 
-                                # Dividir la trama por saltos de línea \n o retornos de carro \r
                                 frames = re.split(r"[\r\n]+", buffer_str)
-
-                                # Guardar el residuo no terminado en el buffer
                                 buffer_str = frames[-1] if len(frames) > 1 else buffer_str
                                 complete_frames = frames[:-1] if len(frames) > 1 else []
 
-                                # Procesar la trama completa MÁS RECIENTE enviada por la báscula
                                 if complete_frames:
                                     latest_frame = complete_frames[-1].strip()
                                     if latest_frame:
-                                        if self.config.get("debug_raw_serial", False):
-                                            try:
-                                                with open("debug_serial.log", "a", encoding="utf-8") as df:
-                                                    df.write(f"[{time.strftime('%H:%M:%S')}] RAW BBG: {latest_frame}\n")
-                                            except Exception:
-                                                pass
-
-                                        # Expresión regular optimizada para BBG Market 30 (ej. ST,GS,+001.450kg -> 1.450)
                                         match = re.search(r"[-+]?\s*(\d+[\.,]\d+|\d+)", latest_frame)
                                         if match:
                                             raw_val = match.group(1).replace(",", ".")
@@ -278,12 +243,19 @@ class ScaleBridgeApp:
                                                 formatted = f"{val_float:.3f}"
                                                 with self.lock:
                                                     self.current_weight = formatted
+                                                    self.is_scale_on = True
+                                                    last_frame_recv_time = time.time()
                                             except ValueError:
                                                 pass
 
                         except Exception as read_err:
-                            print(f"Error de lectura serial en tiempo real: {read_err}")
+                            print(f"Error de lectura serial: {read_err}")
                             break
+
+                    # Si pasan más de 2 segundos sin señal/trama de la báscula, se marca como APAGADA
+                    if time.time() - last_frame_recv_time > 2.0:
+                        with self.lock:
+                            self.is_scale_on = False
 
                     time.sleep(0.03)
 
@@ -292,26 +264,18 @@ class ScaleBridgeApp:
             except Exception as e:
                 self._close_active_serial()
                 with self.lock:
-                    self.status_msg = f"Sin Balanza ({port})"
-                    self.is_connected = False
-
-                print(f"No se pudo conectar a {port}: {e}")
-                
-                if self.config.get("auto_mock_on_error", True):
-                    print("Báscula no detectada. Activando modo simulación automático.")
-                    with self.lock:
-                        self.is_mock = True
-                        if self.current_weight == "0.000":
-                            self.current_weight = "1.450"
+                    self.is_scale_on = False
 
                 time.sleep(2.0)
 
     def _inject_weight(self):
         with self.lock:
+            scale_on = self.is_scale_on
             weight = self.current_weight
 
-        if weight in ["ERR", ""]:
-            print("Peso no válido para inyectar.")
+        if not scale_on:
+            print("No se puede inyectar: La báscula está APAGADA o DESCONECTADA.")
+            self._pulse_hud_red()
             return
 
         sep = self.config.get("decimal_separator", ".")
@@ -329,13 +293,18 @@ class ScaleBridgeApp:
             win32_type_text(weight_str)
 
         self._pulse_hud_green()
-        print(f"Inyectado peso: {weight_str}")
+        print(f"Inyectado peso de báscula real: {weight_str}")
 
     def _pulse_hud_green(self):
         if hasattr(self, "lbl_weight"):
             original_color = "#22C55E"
             self.lbl_weight.config(fg="#86EFAC")
             self.root.after(250, lambda: self.lbl_weight.config(fg=original_color))
+
+    def _pulse_hud_red(self):
+        if hasattr(self, "lbl_weight"):
+            self.lbl_weight.config(fg="#EF4444")
+            self.root.after(250, lambda: self.lbl_weight.config(fg="#64748B"))
 
     def _create_hud(self):
         self.root = tk.Tk()
@@ -344,8 +313,8 @@ class ScaleBridgeApp:
         self.root.attributes("-topmost", True)
         self.root.overrideredirect(True)
 
-        w = self.config.get("hud_width", 210)
-        h = self.config.get("hud_height", 75)
+        w = self.config.get("hud_width", 220)
+        h = self.config.get("hud_height", 80)
         pos = self.config.get("hud_position", "+1150+20")
         self.root.geometry(f"{w}x{h}{pos}")
 
@@ -390,16 +359,25 @@ class ScaleBridgeApp:
 
         self.lbl_weight = tk.Label(
             self.frame,
-            text="0.000 kg",
+            text="--- kg",
             font=("Segoe UI", 18, "bold"),
-            fg="#22C55E",
+            fg="#64748B",
             bg=bg_color
         )
-        self.lbl_weight.pack(pady=(0, 2))
+        self.lbl_weight.pack(pady=(0, 0))
+
+        self.lbl_status_text = tk.Label(
+            self.frame,
+            text="APAGADA / DESCONECTADA",
+            font=("Segoe UI", 7, "bold"),
+            fg="#EF4444",
+            bg=bg_color
+        )
+        self.lbl_status_text.pack(pady=(0, 2))
 
         # Eventos del mouse
         self._drag_data = {"x": 0, "y": 0}
-        for widget in [self.root, self.frame, self.lbl_title, self.lbl_weight, header_frame]:
+        for widget in [self.root, self.frame, self.lbl_title, self.lbl_weight, self.lbl_status_text, header_frame]:
             widget.bind("<Button-1>", self._start_drag)
             widget.bind("<B1-Motion>", self._on_drag)
             widget.bind("<ButtonRelease-1>", self._stop_drag)
@@ -408,18 +386,6 @@ class ScaleBridgeApp:
 
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(label="🔌 Reconectar Puerto RS-232 (COM)", command=self._retry_rs232_connection)
-        self.context_menu.add_separator()
-        self.context_menu.add_command(label="⚡ Probar Inyección (Simular Tecla)", command=self._inject_weight)
-        
-        sim_menu = tk.Menu(self.context_menu, tearoff=0)
-        sim_menu.add_command(label="Establecer 1.450 kg", command=lambda: self._set_sim_weight("1.450"))
-        sim_menu.add_command(label="Establecer 2.500 kg", command=lambda: self._set_sim_weight("2.500"))
-        sim_menu.add_command(label="Establecer 0.750 kg", command=lambda: self._set_sim_weight("0.750"))
-        sim_menu.add_command(label="Establecer 5.000 kg", command=lambda: self._set_sim_weight("5.000"))
-        sim_menu.add_command(label="Establecer 0.000 kg", command=lambda: self._set_sim_weight("0.000"))
-        
-        self.context_menu.add_cascade(label="⚖️ Cambiar Peso de Prueba", menu=sim_menu)
-        self.context_menu.add_command(label="🔄 Alternar Modo Simulación", command=self._toggle_mock)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="❌ Salir", command=self._quit_app)
 
@@ -453,41 +419,27 @@ class ScaleBridgeApp:
         finally:
             self.context_menu.grab_release()
 
-    def _set_sim_weight(self, weight_str):
-        with self.lock:
-            self.is_mock = True
-            self.current_weight = weight_str
-        print(f"Peso simulado establecido a: {weight_str}")
-
-    def _toggle_mock(self):
-        with self.lock:
-            self.is_mock = not self.is_mock
-            if self.is_mock:
-                self.current_weight = "1.450"
-        print(f"Modo Simulación: {self.is_mock}")
-
     def _update_hud_loop(self):
         if not self.running:
             return
 
         with self.lock:
             weight = self.current_weight
-            is_conn = self.is_connected
-            is_mock = self.is_mock
+            is_scale_on = self.is_scale_on
 
-        prefix = "SIM " if is_mock else ""
-        self.lbl_weight.config(text=f"{prefix}{weight} kg")
+        if is_scale_on:
+            self.lbl_weight.config(text=f"{weight} kg", fg="#22C55E")
+            self.lbl_status_text.config(text="ENCENDIDA / CONECTADA", fg="#22C55E")
+            self.canvas_status.itemconfig(self.status_dot, fill="#22C55E")
+        else:
+            self.lbl_weight.config(text="--- kg", fg="#64748B")
+            self.lbl_status_text.config(text="APAGADA / DESCONECTADA", fg="#EF4444")
+            self.canvas_status.itemconfig(self.status_dot, fill="#EF4444")
 
-        color = "#22C55E" if is_conn else "#EF4444"
-        if is_mock:
-            color = "#3B82F6"
-
-        self.canvas_status.itemconfig(self.status_dot, fill=color)
-
-        self.root.after(40, self._update_hud_loop)  # Refresco continuo a ~25 FPS en el HUD
+        self.root.after(40, self._update_hud_loop)
 
     def _quit_app(self):
-        print("Cerrando aplicación de forma limpia...")
+        print("Cerrando aplicación...")
         self.running = False
         self._close_active_serial()
 
