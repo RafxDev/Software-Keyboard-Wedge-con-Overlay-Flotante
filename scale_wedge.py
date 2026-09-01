@@ -115,7 +115,7 @@ class ScaleBridgeApp:
         self.pynput_listener = None
         self.reconnect_requested = False
 
-        # Hilo de lectura ultrarrápida sin latencia ni búferes acumulados
+        # Hilo de lectura estable en tiempo real
         self.serial_thread = threading.Thread(target=self._realtime_hardware_worker, daemon=True)
         self.serial_thread.start()
 
@@ -207,7 +207,7 @@ class ScaleBridgeApp:
         return ports_list
 
     def _realtime_hardware_worker(self):
-        """Monitorea el puerto COM en tiempo real con latencia cero y vaciado automático de búfer."""
+        """Monitorea el puerto COM manteniendo el peso ESTABLE sin parpadeos a cero mientras haya un objeto."""
         baudrates = [self.config.get("baudrate", 9600), 9600, 2400, 4800]
         baudrates = list(dict.fromkeys(baudrates))
 
@@ -248,7 +248,7 @@ class ScaleBridgeApp:
                         last_valid_data_time = time.time()
                         found_scale_on_port = False
 
-                        # Prueba inicial de 1 segundo para verificar flujo de datos
+                        # Prueba inicial de 1 segundo para verificar datos activos
                         start_test = time.time()
                         while self.running and not self.reconnect_requested and (time.time() - start_test < 1.0):
                             if self.active_ser and self.active_ser.is_open:
@@ -256,24 +256,20 @@ class ScaleBridgeApp:
                                     waiting = self.active_ser.in_waiting
                                     if waiting > 0:
                                         raw_bytes = self.active_ser.read(waiting)
-                                        # Vaciar cualquier residuo antiguo del puerto COM para latencia CERO
                                         self.active_ser.reset_input_buffer()
 
                                         decoded = raw_bytes.decode("latin-1", errors="ignore")
                                         buffer_str += decoded
 
-                                        # Buscar todas las mediciones numéricas en el búfer
                                         matches = re.findall(r"[-+]?\s*(\d+[\.,]\d+|\d+)", buffer_str)
                                         if matches:
-                                            # Tomar SIEMPRE la medición MÁS RECIENTE
                                             latest_raw = matches[-1].replace(",", ".")
                                             try:
                                                 val_float = float(latest_raw)
-                                                formatted = f"{val_float:.3f}"
+                                                formatted = "0.000" if val_float < 0.005 else f"{val_float:.3f}"
                                                 with self.lock:
                                                     self.current_weight = formatted
                                                     self.is_scale_on = True
-                                                    self.active_port_name = port_name
                                                     self.status_detail = f"ENCENDIDA ({port_name})"
                                                 found_scale_on_port = True
                                                 last_valid_data_time = time.time()
@@ -290,9 +286,9 @@ class ScaleBridgeApp:
                                     break
                             time.sleep(0.02)
 
-                        # Bucle principal si la báscula está respondiendo en este puerto
+                        # Bucle principal: mantiene el peso constante y solo regresa a 0 al recibir 0 o al retirar el objeto
                         if found_scale_on_port:
-                            print(f"¡Báscula transmitiendo en tiempo real por {port_name} ({baud} baudios)!")
+                            print(f"¡Báscula transmitiendo estable en {port_name}!")
                             
                             while self.running and not self.reconnect_requested:
                                 if self.active_ser and self.active_ser.is_open:
@@ -310,7 +306,12 @@ class ScaleBridgeApp:
                                                 latest_raw = matches[-1].replace(",", ".")
                                                 try:
                                                     val_float = float(latest_raw)
-                                                    formatted = f"{val_float:.3f}"
+                                                    # Umbral de cero: si la lectura enviada es menor a 5 gramos (0.005 kg), mostrar 0.000
+                                                    if val_float < 0.005:
+                                                        formatted = "0.000"
+                                                    else:
+                                                        formatted = f"{val_float:.3f}"
+
                                                     with self.lock:
                                                         self.current_weight = formatted
                                                         self.is_scale_on = True
@@ -323,21 +324,15 @@ class ScaleBridgeApp:
                                         print(f"Error de lectura serial: {err}")
                                         break
 
-                                # Si se retira el producto y la báscula deja de enviar tramas continuas por > 0.8s
-                                # o si no hay datos nuevos, resetear el peso a 0.000 kg inmediatamente
                                 now = time.time()
-                                if now - last_valid_data_time > 0.8:
-                                    with self.lock:
-                                        self.current_weight = "0.000"
-
-                                # Si pasan más de 2.5 segundos sin ningún byte, marcar como APAGADA
-                                if now - last_valid_data_time > 2.5:
+                                # Si transcurren más de 4.0 segundos sin recibir datos por el puerto, marcar como APAGADA
+                                if now - last_valid_data_time > 4.0:
                                     with self.lock:
                                         self.is_scale_on = False
                                         self.status_detail = f"APAGADA ({port_name})"
                                     break
 
-                                time.sleep(0.02)  # Bucle ultra-rápido a 50 lecturas por segundo
+                                time.sleep(0.02)
 
                             active_connection = True
                             break
@@ -518,12 +513,12 @@ class ScaleBridgeApp:
             self.lbl_status_text.config(text=status_text, fg="#22C55E")
             self.canvas_status.itemconfig(self.status_dot, fill="#22C55E")
         else:
-            self.lbl_weight.config(text=f"{weight} kg" if weight != "0.000" else "--- kg", fg="#64748B")
+            self.lbl_weight.config(text=f"{weight} kg", fg="#64748B")
             self.lbl_status_text.config(text=status_text, fg="#EF4444" if "APAGADA" in status_text else "#EAB308")
             dot_color = "#EF4444" if "APAGADA" in status_text else "#EAB308"
             self.canvas_status.itemconfig(self.status_dot, fill=dot_color)
 
-        self.root.after(30, self._update_hud_loop)  # Refresco ultra-fluido a ~33 FPS
+        self.root.after(30, self._update_hud_loop)
 
     def _quit_app(self):
         print("Cerrando aplicación...")
