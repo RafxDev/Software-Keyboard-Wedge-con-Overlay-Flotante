@@ -105,7 +105,7 @@ def save_config(config):
 class ScaleBridgeApp:
     def __init__(self):
         self.config = load_config()
-        self.current_weight = "1.450"
+        self.current_weight = "0.000"
         self.status_msg = "Inicializando..."
         self.is_connected = False
         self.is_mock = self.config.get("mock_mode", False)
@@ -116,7 +116,10 @@ class ScaleBridgeApp:
         self.pynput_listener = None
         self.reconnect_requested = False
 
-        # Iniciar ÚNICO hilo de lectura serial controlado
+        if self.is_mock:
+            self.current_weight = "1.450"
+
+        # Iniciar hilo de lectura serial en tiempo real
         self.serial_thread = threading.Thread(target=self._serial_worker, daemon=True)
         self.serial_thread.start()
 
@@ -167,9 +170,9 @@ class ScaleBridgeApp:
         self._inject_weight()
 
     def _retry_rs232_connection(self):
-        """Solicita reconexión limpia al hilo trabajador serial sin crear hilos adicionales."""
+        """Fuerza reconexión limpia al puerto RS-232 en tiempo real."""
         port = self.config.get("port", "COM3")
-        print(f"Solicitando reconexión al puerto RS-232 {port}...")
+        print(f"Fuerza reconexión al puerto RS-232 {port}...")
         with self.lock:
             self.is_mock = False
             self.reconnect_requested = True
@@ -190,7 +193,9 @@ class ScaleBridgeApp:
                 self.active_ser = None
 
     def _serial_worker(self):
-        """ÚNICO hilo de gestión y lectura del puerto serial RS-232."""
+        """Hilo dedicado a la lectura e interpretación en TIEMPO REAL del puerto serial RS-232."""
+        buffer_str = ""
+
         while self.running:
             with self.lock:
                 is_mock = self.is_mock
@@ -203,7 +208,7 @@ class ScaleBridgeApp:
                 with self.lock:
                     self.status_msg = "Modo Simulación"
                     self.is_connected = True
-                time.sleep(1)
+                time.sleep(0.2)
                 continue
 
             port = self.config.get("port", "COM3")
@@ -217,37 +222,62 @@ class ScaleBridgeApp:
                 time.sleep(2)
                 continue
 
-            # Intentar conexión serial limpia
             self._close_active_serial()
             try:
-                print(f"Intentando abrir puerto {port} a {baudrate} baudios...")
-                self.active_ser = serial.Serial(port, baudrate, timeout=0.2)
+                print(f"Conectando al puerto {port} ({baudrate} baudios)...")
+                self.active_ser = serial.Serial(
+                    port=port,
+                    baudrate=baudrate,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=0.1
+                )
                 
                 with self.lock:
                     self.status_msg = f"Conectado ({port})"
                     self.is_connected = True
                     self.is_mock = False
 
-                # Bucle de lectura mientras la conexión esté activa
+                buffer_str = ""
+
+                # Bucle de lectura de alta frecuencia en tiempo real (50ms por iteración)
                 while self.running and not self.is_mock and not self.reconnect_requested:
                     if self.active_ser and self.active_ser.is_open:
                         try:
-                            line = self.active_ser.readline().decode("latin-1", errors="ignore").strip()
-                            if line:
-                                match = re.search(r"(\d+\.\d+|\d+,\d+|\d+)", line)
-                                if match:
-                                    raw_val = match.group(1).replace(",", ".")
-                                    try:
-                                        val_float = float(raw_val)
-                                        formatted = f"{val_float:.3f}"
-                                        with self.lock:
-                                            self.current_weight = formatted
-                                    except ValueError:
-                                        pass
+                            waiting = self.active_ser.in_waiting
+                            if waiting > 0:
+                                raw_bytes = self.active_ser.read(waiting)
+                                decoded = raw_bytes.decode("latin-1", errors="ignore")
+                                buffer_str += decoded
+
+                                # Dividir la trama por saltos de línea \n o retornos de carro \r
+                                frames = re.split(r"[\r\n]+", buffer_str)
+
+                                # Guardar el residuo no terminado en el buffer
+                                buffer_str = frames[-1] if len(frames) > 1 else buffer_str
+                                complete_frames = frames[:-1] if len(frames) > 1 else []
+
+                                # Procesar la trama completa MÁS RECIENTE enviada por la báscula
+                                if complete_frames:
+                                    latest_frame = complete_frames[-1].strip()
+                                    if latest_frame:
+                                        match = re.search(r"[-+]?\s*(\d+[\.,]\d+|\d+)", latest_frame)
+                                        if match:
+                                            raw_val = match.group(1).replace(",", ".")
+                                            try:
+                                                val_float = float(raw_val)
+                                                formatted = f"{val_float:.3f}"
+                                                with self.lock:
+                                                    self.current_weight = formatted
+                                            except ValueError:
+                                                pass
+
                         except Exception as read_err:
-                            print(f"Error de lectura serial: {read_err}")
+                            print(f"Error de lectura serial en tiempo real: {read_err}")
                             break
-                    time.sleep(0.05)
+
+                    time.sleep(0.03)
 
                 self._close_active_serial()
 
@@ -256,25 +286,23 @@ class ScaleBridgeApp:
                 with self.lock:
                     self.status_msg = f"Sin Balanza ({port})"
                     self.is_connected = False
-                    if self.current_weight == "0.000":
-                        self.current_weight = "1.450"
 
                 print(f"No se pudo conectar a {port}: {e}")
                 
-                # Si falló la conexión y auto_mock está habilitado, pasar a simulación sin bucles infinitos
                 if self.config.get("auto_mock_on_error", True):
-                    print("Cambiando a modo simulación tras fallo de puerto COM.")
+                    print("Báscula no detectada. Activando modo simulación automático.")
                     with self.lock:
                         self.is_mock = True
+                        if self.current_weight == "0.000":
+                            self.current_weight = "1.450"
 
-                # Pausa para evitar spamear intentos de puerto en bucle rápido
-                time.sleep(2.5)
+                time.sleep(2.0)
 
     def _inject_weight(self):
         with self.lock:
             weight = self.current_weight
 
-        if weight in ["ERR", ""] or (weight == "0.000" and not self.is_mock):
+        if weight in ["ERR", ""]:
             print("Peso no válido para inyectar.")
             return
 
@@ -354,7 +382,7 @@ class ScaleBridgeApp:
 
         self.lbl_weight = tk.Label(
             self.frame,
-            text="1.450 kg",
+            text="0.000 kg",
             font=("Segoe UI", 18, "bold"),
             fg="#22C55E",
             bg=bg_color
@@ -448,7 +476,7 @@ class ScaleBridgeApp:
 
         self.canvas_status.itemconfig(self.status_dot, fill=color)
 
-        self.root.after(100, self._update_hud_loop)
+        self.root.after(40, self._update_hud_loop)  # Refresco continuo a ~25 FPS en el HUD
 
     def _quit_app(self):
         print("Cerrando aplicación de forma limpia...")
